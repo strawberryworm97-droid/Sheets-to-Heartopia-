@@ -1,4 +1,4 @@
-Converts sheet music/midi into playable Heartopia "sheets"
+**Converts sheet music/midi into playable Heartopia "sheets"**
 
 **(Alpha version)**
 
