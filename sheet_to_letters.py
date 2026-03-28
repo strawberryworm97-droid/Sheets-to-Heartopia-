@@ -8,6 +8,7 @@ Does not read scanned PDFs or images — use MuseScore or similar to export Musi
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import tkinter as tk
 from collections import defaultdict
@@ -16,8 +17,15 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Iterable
 
 from music21 import chord, converter, interval, note, stream
-
-from heartopia_maps import pitch_to_heartopia_key
+ 
+from heartopia_maps import (
+    pitch_to_heartopia_key_custom,
+    build_default_keymaps,
+    DEFAULT_MIDI_TOP,
+    DEFAULT_MIDI_MIDDLE_37,
+    DEFAULT_MIDI_BOTTOM_37,
+    DEFAULT_MIDI_15,
+)
 
 # Visual gap between clusters (easier to scan while playing).
 CLUSTER_GAP = "  "
@@ -94,12 +102,19 @@ def stream_to_letter_line(
     return separator.join(tokens)
 
 
-def _quarter_beats(el) -> int:
+def _duration_units(el, units_per_quarter: int = 4) -> int:
+    """
+    Convert note/rest duration into grid units.
+    Default grid: 4 units per quarter note
+    - quarter = 4
+    - eighth = 2
+    - 16th = 1
+    """
     ql = float(el.duration.quarterLength)
     if ql <= 0:
         ql = 0.25
-    b = int(round(ql))
-    return max(1, b)
+    u = int(round(ql * units_per_quarter))
+    return max(1, u)
 
 
 def _hold_suffix(hold_count: int, compress_double: bool) -> str:
@@ -119,6 +134,91 @@ def _hold_suffix(hold_count: int, compress_double: bool) -> str:
             i += 1
     return "".join(parts)
 
+def _gap_from_onset_delta(delta: float) -> str:
+    EPS = 1e-6
+    delta = float(delta)
+
+    if delta <= 0.25 + EPS:
+        return " "     # 16th = no extra visible gap beyond token separation
+    elif delta <= 0.5 + EPS:
+        return "  "    # 8th
+    else:
+        return "   "   # quarter+
+
+
+def _join_timed_tokens(timed_tokens: list[tuple[float, str]]) -> str:
+    """
+    Join (offset, token) pairs using rhythm-aware spacing.
+    """
+    if not timed_tokens:
+        return ""
+
+    out = [timed_tokens[0][1]]
+    prev_offset = timed_tokens[0][0]
+
+    for offset, token in timed_tokens[1:]:
+        out.append(_gap_from_onset_delta(offset - prev_offset))
+        out.append(token)
+        prev_offset = offset
+
+    return "".join(out)
+
+
+def _wrap_timed_tokens(
+    timed_tokens: list[tuple[float, str]],
+    width: int = 80,
+    break_threshold: float = 0.5,
+) -> str:
+    """
+    Wrap rhythm-aware output without splitting close rhythmic groups.
+
+    break_threshold:
+    - gaps <= this stay in the same unbreakable chunk
+    - gaps > this are allowed wrap points
+
+    Default:
+    - 0.5 quarterLength = eighth-note threshold
+    So 16ths and 8ths stay grouped together.
+    """
+    if not timed_tokens:
+        return ""
+
+    # Step 1: build larger chunks that should stay together
+    chunks: list[str] = []
+    current_chunk = timed_tokens[0][1]
+    prev_offset = timed_tokens[0][0]
+
+    for offset, token in timed_tokens[1:]:
+        delta = float(offset) - float(prev_offset)
+        gap = _gap_from_onset_delta(delta)
+
+        if delta <= break_threshold:
+            # Keep this token glued to the current chunk
+            current_chunk += gap + token
+        else:
+            # Start a new chunk
+            chunks.append(current_chunk)
+            current_chunk = token
+
+        prev_offset = offset
+
+    chunks.append(current_chunk)
+
+    # Step 2: wrap only between chunks
+    lines: list[str] = []
+    current_line = chunks[0]
+
+    for chunk in chunks[1:]:
+        piece = " " + chunk   # small separator between larger wrap chunks
+
+        if len(current_line) + len(piece) <= width:
+            current_line += piece
+        else:
+            lines.append(current_line)
+            current_line = chunk
+
+    lines.append(current_line)
+    return "\n".join(lines)
 
 def _join_heartopia_tokens(tokens: list[str], gap: str = CLUSTER_GAP) -> str:
     """Join cluster tokens; __RESTn__ expands to n spaces (no asterisks)."""
@@ -203,19 +303,19 @@ def _iter_measure_streams(part: stream.Stream) -> list[tuple[str, stream.Stream]
 
 
 def _collect_pitches_and_rest(grp: list) -> tuple[list, int]:
-    """Return (list of (pitch, beats), rest_beats)."""
+    """Return (list of (pitch, units), rest_units)."""
     pitch_dur: list[tuple] = []
-    rest_beats = 0
+    rest_units = 0
     for el in grp:
-        b = _quarter_beats(el)
+        u = _duration_units(el)
         if isinstance(el, note.Rest):
-            rest_beats = max(rest_beats, b)
+            rest_units = max(rest_units, u)
         elif isinstance(el, chord.Chord):
             for p in el.pitches:
-                pitch_dur.append((p, b))
+                pitch_dur.append((p, u))
         elif isinstance(el, note.Note):
-            pitch_dur.append((el.pitch, b))
-    return pitch_dur, rest_beats
+            pitch_dur.append((el.pitch, u))
+    return pitch_dur, rest_units
 
 
 def _heartopia_cluster_token(
@@ -224,6 +324,7 @@ def _heartopia_cluster_token(
     transpose_semitones: int,
     compress_double_hold: bool,
     *,
+    keymaps: dict[str, dict[int, str]] | None = None,
     rest_as_token: bool,
     rest_one_beat_space: bool = True,
     include_holds: bool = True,
@@ -238,8 +339,8 @@ def _heartopia_cluster_token(
     if pitch_dur:
         hold_str = ""
         if include_holds:
-            max_b = max(b for _, b in pitch_dur)
-            holds = max(0, max_b - 1)
+            max_u = max(u for _, u in pitch_dur)
+            holds = max(0, max_u - 1)
             hold_str = _hold_suffix(holds, compress_double_hold)
 
         uniq_p: list = []
@@ -248,8 +349,13 @@ def _heartopia_cluster_token(
             if p.midi not in seen:
                 seen.add(p.midi)
                 uniq_p.append(p)
+        if keymaps is None:
+            raise ValueError("Custom keymaps are required for Heartopia conversion.")
 
-        keys = [pitch_to_heartopia_key(p, layout, transpose_semitones) for p in uniq_p]
+        keys = [
+            pitch_to_heartopia_key_custom(p, layout, keymaps, transpose_semitones)
+            for p in uniq_p
+        ]
         return "".join(keys) + hold_str
 
     if rest_beats:
@@ -271,6 +377,7 @@ def stream_to_heartopia_line(
     compress_double_hold: bool = False,
     sheet_measures: bool = True,
     grouping_mode: str = "sheet_faithful",
+    keymaps: dict[str, dict[int, str]] | None = None,
 ) -> str:
     """Heartopia keyboard codes in either sheet-faithful or playable grouping."""
     if not sheet_measures:
@@ -281,13 +388,14 @@ def stream_to_heartopia_line(
             rest_one_beat_space=rest_one_beat_space,
             compress_double_hold=compress_double_hold,
             grouping_mode=grouping_mode,
+            keymaps=keymaps,
         )
 
     lines: list[str] = []
     for label, meas in _iter_measure_streams(s):
         if grouping_mode == "sheet_faithful":
             groups = _group_by_same_onset(meas)
-            include_holds = True
+            include_holds = False
         elif grouping_mode == "playable":
             groups = _group_by_active_beats(meas)
             include_holds = False
@@ -301,6 +409,7 @@ def stream_to_heartopia_line(
                 layout,
                 transpose_semitones,
                 compress_double_hold,
+                keymaps=keymaps,
                 rest_as_token=False,
                 rest_one_beat_space=rest_one_beat_space,
                 include_holds=include_holds,
@@ -325,33 +434,40 @@ def stream_to_heartopia_flat(
     rest_one_beat_space: bool = True,
     compress_double_hold: bool = False,
     grouping_mode: str = "sheet_faithful",
+    keymaps: dict[str, dict[int, str]] | None = None,
 ) -> str:
-    """Single line Heartopia output."""
-    if grouping_mode == "sheet_faithful":
-        groups = _group_by_same_onset(s)
-        include_holds = True
-    elif grouping_mode == "playable":
-        groups = _group_by_active_beats(s)
-        include_holds = False
-    else:
-        raise ValueError(f"Unknown grouping_mode: {grouping_mode}")
+    """
+    Single line Heartopia output.
 
-    tokens: list[str] = []
+    Rules:
+    - same onset / chord -> fused token (e.g. h3)
+    - 16th apart -> 1 space
+    - 8th apart -> 2 spaces
+    - quarter or more -> 3 spaces
+    """
+    timed_tokens: list[tuple[float, str]] = []
+
+    # Flat mode should be onset-based for readable rhythmic spacing.
+    groups = _group_by_same_onset(s)
+
     for grp in groups:
-        t = _heartopia_cluster_token(
+        offset = min(float(el.offset) for el in grp)
+
+        token = _heartopia_cluster_token(
             grp,
             layout,
             transpose_semitones,
             compress_double_hold,
-            rest_as_token=True,
+            keymaps=keymaps,
+            rest_as_token=False,   # cleaner flat output; rests affect spacing via onset gaps
             rest_one_beat_space=rest_one_beat_space,
-            include_holds=include_holds,
+            include_holds=False,
         )
-        if t:
-            tokens.append(t)
 
-    return _join_heartopia_tokens(tokens)
+        if token:
+            timed_tokens.append((offset, token))
 
+    return _wrap_timed_tokens(timed_tokens, width=80, break_threshold=0.5)
 
 def convert_file(
     path: Path | str,
@@ -368,6 +484,7 @@ def convert_file(
     heartopia_compress_hold: bool = False,
     heartopia_sheet_measures: bool = True,
     grouping_mode: str = "sheet_faithful",
+    keymaps: dict[str, dict[int, str]] | None = None,
 ) -> str:
     """Parse a file and return letter notes or Heartopia key codes."""
     if output_mode == "heartopia_37":
@@ -418,6 +535,7 @@ def convert_file(
                 compress_double_hold=heartopia_compress_hold,
                 sheet_measures=heartopia_sheet_measures,
                 grouping_mode=grouping_mode,
+                keymaps=keymaps,
             )
         else:
             raise ValueError(f"Unknown output_mode: {output_mode}")
@@ -515,6 +633,18 @@ class SheetToLettersApp(tk.Tk):
         self.title("Sheet music → Heartopia")
         self.minsize(620, 480)
         self._path: Path | None = None
+        import sys
+        from pathlib import Path
+
+        if getattr(sys, "frozen", False):
+            base_dir = Path(sys.executable).resolve().parent
+        else:
+            base_dir = Path(__file__).resolve().parent
+
+        self.settings_path = base_dir / "heartopia_keymaps.json"
+        self.keymaps = build_default_keymaps()
+        self._load_keymaps_from_disk()
+        self.keybinding_vars: dict[tuple[str, int], tk.StringVar] = {}
 
         bg = "#ffffff"
         accent = "#ec4899"
@@ -561,8 +691,17 @@ class SheetToLettersApp(tk.Tk):
 
         main = ttk.Frame(self, padding=12)
         main.pack(fill=tk.BOTH, expand=True)
+        notebook = ttk.Notebook(main)
+        notebook.pack(fill=tk.BOTH, expand=True)
 
-        row1 = ttk.Frame(main)
+        converter_tab = ttk.Frame(notebook, padding=12)
+        keybindings_tab = ttk.Frame(notebook, padding=12)
+
+        notebook.add(converter_tab, text="Converter")
+        notebook.add(keybindings_tab, text="Keybindings")
+        self._build_keybindings_tab(keybindings_tab)
+
+        row1 = ttk.Frame(converter_tab)
         row1.pack(fill=tk.X, pady=(0, 8))
 
         ttk.Button(row1, text="Open file…", command=self._open_file, style="Pink.TButton").pack(
@@ -573,7 +712,7 @@ class SheetToLettersApp(tk.Tk):
             side=tk.LEFT, padx=(12, 0)
         )
 
-        opts = ttk.Frame(main)
+        opts = ttk.Frame(converter_tab)
         opts.pack(fill=tk.X, pady=(0, 8))
 
         ttk.Label(opts, text="Output format:").pack(side=tk.LEFT)
@@ -606,23 +745,8 @@ class SheetToLettersApp(tk.Tk):
             state="readonly",
             width=5,
         ).pack(side=tk.LEFT, padx=(6, 0))
-
-        self.grouping_label_var = tk.StringVar(value="Playable")
-        self.grouping_mode_map = {
-            "Sheet faithful": "sheet_faithful",
-            "Playable": "playable",
-        }
-
-        ttk.Label(opts, text="Grouping:").pack(side=tk.LEFT, padx=(16, 0))
-        ttk.Combobox(
-            opts,
-            textvariable=self.grouping_label_var,
-            values=("Sheet faithful", "Playable"),
-            state="readonly",
-            width=14,
-        ).pack(side=tk.LEFT, padx=(6, 0))
         
-        btn_row = ttk.Frame(main)
+        btn_row = ttk.Frame(converter_tab)
         btn_row.pack(fill=tk.X, pady=(0, 8))
         ttk.Button(btn_row, text="Convert", command=self._convert, style="Pink.TButton").pack(
             side=tk.LEFT
@@ -635,7 +759,7 @@ class SheetToLettersApp(tk.Tk):
         )
 
         self.out = scrolledtext.ScrolledText(
-            main,
+            converter_tab,
             height=20,
             wrap="none",
             font=("Consolas", 11),
@@ -650,15 +774,120 @@ class SheetToLettersApp(tk.Tk):
         )
         self.out.pack(fill=tk.BOTH, expand=True)
 
+    def _build_keybindings_tab(self, parent) -> None:
+        outer = ttk.Frame(parent)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(outer, bg="#ffffff", highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        content = ttk.Frame(canvas)
+
+        content.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=content, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
         ttk.Label(
-            main,
-            text=(
-                "Heartopia 22 = full in-game keyboard. Same attack time = one cluster (e.g. 3r); double spaces "
-                "between clusters. Sequential notes stay separate. > holds."
-            ),
-            font=("Segoe UI", 8),
-            foreground="#9ca3af",
-        ).pack(anchor=tk.W, pady=(8, 0))
+            content,
+            text="Heartopia Keybindings",
+            font=("Segoe UI", 16, "bold"),
+        ).pack(anchor="w", pady=(0, 8))
+
+        ttk.Label(
+            content,
+            text="Edit the actual note output keys for each supported MIDI pitch.",
+            font=("Segoe UI", 9),
+        ).pack(anchor="w", pady=(0, 16))
+
+        sections = [
+            ("22-key Top Row", "top_22", sorted(DEFAULT_MIDI_TOP.keys())),
+            ("22-key Middle Row", "middle_22", sorted(DEFAULT_MIDI_MIDDLE_37.keys())),
+            ("22-key Bottom Row", "bottom_22", sorted(DEFAULT_MIDI_BOTTOM_37.keys())),
+            ("15-key Layout", "layout_15", sorted(DEFAULT_MIDI_15.keys())),
+        ]
+
+        for title, map_name, midi_list in sections:
+            section = ttk.Frame(content)
+            section.pack(fill=tk.X, pady=(0, 18))
+
+            ttk.Label(
+                section,
+                text=title,
+                font=("Segoe UI", 13, "bold"),
+            ).pack(anchor="w", pady=(0, 8))
+
+            for midi_num in midi_list:
+                row = ttk.Frame(section)
+                row.pack(fill=tk.X, pady=2)
+
+                ttk.Label(
+                    row,
+                    text=f"MIDI {midi_num}",
+                    width=12,
+                    anchor="w",
+                    font=("Segoe UI", 10),
+                ).pack(side=tk.LEFT, padx=(0, 10))
+
+                var = tk.StringVar(value=self.keymaps[map_name][midi_num])
+                self.keybinding_vars[(map_name, midi_num)] = var
+
+                entry = ttk.Entry(row, textvariable=var, width=8, font=("Consolas", 11))
+                entry.pack(side=tk.LEFT)
+
+        btn_row = ttk.Frame(content)
+        btn_row.pack(fill=tk.X, pady=(10, 0))
+
+        ttk.Button(
+            btn_row,
+            text="Apply all",
+            style="Pink.TButton",
+            command=self._apply_all_keybindings,
+        ).pack(side=tk.LEFT)
+
+        ttk.Button(
+            btn_row,
+            text="Reset defaults",
+            style="Pink.TButton",
+            command=self._reset_keybindings_defaults,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+    def _load_keymaps_from_disk(self) -> None:
+                if not self.settings_path.is_file():
+                    return
+
+                try:
+                    raw = json.loads(self.settings_path.read_text(encoding="utf-8"))
+
+                    for map_name, midi_map in raw.items():
+                        if map_name not in self.keymaps:
+                            continue
+
+                        for midi_num_str, value in midi_map.items():
+                            midi_num = int(midi_num_str)
+                            if midi_num in self.keymaps[map_name]:
+                                self.keymaps[map_name][midi_num] = str(value)
+
+                except Exception as e:
+                    print(f"WARNING: failed to load keymaps: {e}")
+    def _save_keymaps_to_disk(self) -> None:
+        try:
+            serializable = {
+                map_name: {str(midi_num): value for midi_num, value in midi_map.items()}
+                for map_name, midi_map in self.keymaps.items()
+            }
+
+            self.settings_path.write_text(
+                json.dumps(serializable, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            messagebox.showerror("Save error", f"Could not save keybindings:\n{e}")            
 
     def _open_file(self) -> None:
         path = filedialog.askopenfilename(
@@ -679,9 +908,6 @@ class SheetToLettersApp(tk.Tk):
             return
 
         try:
-            grouping_mode = self.grouping_mode_map[self.grouping_label_var.get()]
-
-            print("DEBUG grouping:", grouping_mode)
             print("DEBUG xml correction:", self.xml_octave_var.get())
             print("DEBUG format:", self.format_var.get())
 
@@ -692,8 +918,9 @@ class SheetToLettersApp(tk.Tk):
                 xml_octave_correction=int(self.xml_octave_var.get()),
                 heartopia_rest_space=True,
                 heartopia_compress_hold=False,
-                heartopia_sheet_measures=True,
-                grouping_mode=grouping_mode,
+                heartopia_sheet_measures=False,
+                grouping_mode="sheet_faithful",
+                keymaps=self.keymaps,
             )
         except Exception as e:
             messagebox.showerror("Conversion failed", str(e))
@@ -707,6 +934,36 @@ class SheetToLettersApp(tk.Tk):
         self.clipboard_append(self.out.get("1.0", tk.END))
         messagebox.showinfo("Copied", "Output copied to clipboard.")
 
+    def _is_valid_binding(self, value: str) -> bool:
+        return bool(value.strip())
+
+
+    def _apply_all_keybindings(self) -> None:
+        for (map_name, midi_num), var in self.keybinding_vars.items():
+            value = var.get().strip()
+            if not self._is_valid_binding(value):
+                messagebox.showerror(
+                    "Invalid keybinding",
+                    f"Binding for MIDI {midi_num} cannot be empty."
+                )
+                return
+
+        for (map_name, midi_num), var in self.keybinding_vars.items():
+            self.keymaps[map_name][midi_num] = var.get().strip()
+
+        self._save_keymaps_to_disk()
+        messagebox.showinfo("Keybindings", "Custom keybindings applied.")
+
+
+    def _reset_keybindings_defaults(self) -> None:
+        self.keymaps = build_default_keymaps()
+
+        for (map_name, midi_num), var in self.keybinding_vars.items():
+            var.set(self.keymaps[map_name][midi_num])
+
+        self._save_keymaps_to_disk()
+        messagebox.showinfo("Keybindings", "Default keybindings restored.")
+    
     def _save(self) -> None:
         path = filedialog.asksaveasfilename(
             defaultextension=".txt",

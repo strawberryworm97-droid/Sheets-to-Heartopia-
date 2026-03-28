@@ -10,6 +10,7 @@ Full in-game layout (named heartopia_22 in the app):
 """
 
 from __future__ import annotations
+from copy import deepcopy
 
 # Top row (high octave), MIDI 72–84
 MIDI_TOP: dict[int, str] = {
@@ -82,6 +83,19 @@ MIDI_15: dict[int, str] = {
 ALLOWED_MIDI_15 = frozenset(MIDI_15.keys())
 ALLOWED_MIDI_37 = frozenset(range(48, 85))
 
+DEFAULT_MIDI_TOP = dict(MIDI_TOP)
+DEFAULT_MIDI_MIDDLE_37 = dict(MIDI_MIDDLE_37)
+DEFAULT_MIDI_BOTTOM_37 = dict(MIDI_BOTTOM_37)
+DEFAULT_MIDI_15 = dict(MIDI_15)
+
+
+def build_default_keymaps() -> dict[str, dict[int, str]]:
+    return {
+        "top_22": deepcopy(DEFAULT_MIDI_TOP),
+        "middle_22": deepcopy(DEFAULT_MIDI_MIDDLE_37),
+        "bottom_22": deepcopy(DEFAULT_MIDI_BOTTOM_37),
+        "layout_15": deepcopy(DEFAULT_MIDI_15),
+    }
 
 def nearest_midi(midi: int, allowed: frozenset[int]) -> int:
     if midi in allowed:
@@ -123,4 +137,54 @@ def pitch_to_heartopia_key(p, layout: str, transpose_semitones: int = 0) -> str:
         return midi_to_key_15(midi)
     if layout == "heartopia_22":
         return midi_to_key_37(midi)
+    raise ValueError(f"Unknown layout: {layout}")
+
+def midi_to_key_37_custom(midi: int, keymaps: dict[str, dict[int, str]]) -> str:
+    m = int(round(midi))
+
+    bottom = keymaps["bottom_22"]
+    middle = keymaps["middle_22"]
+    top = keymaps["top_22"]
+
+    if 48 <= m <= 59:
+        return bottom[m]
+    if 60 <= m <= 71:
+        return middle[m]
+    if 72 <= m <= 84:
+        return top[m]
+
+    n = nearest_midi(m, ALLOWED_MIDI_37)
+    if 48 <= n <= 59:
+        return bottom[n]
+    if 60 <= n <= 71:
+        return middle[n]
+    return top[n]
+
+
+def midi_to_key_15_custom(midi: int, keymaps: dict[str, dict[int, str]]) -> str:
+    m = int(round(midi))
+    n = nearest_midi(m, ALLOWED_MIDI_15)
+    return keymaps["layout_15"][n]
+
+
+def pitch_to_heartopia_key_custom(
+    p,
+    layout: str,
+    keymaps: dict[str, dict[int, str]],
+    transpose_semitones: int = 0,
+) -> str:
+    from music21.pitch import Pitch
+
+    if isinstance(p, Pitch):
+        midi = p.midi
+    else:
+        midi = int(p)
+
+    midi = max(0, min(127, midi + transpose_semitones))
+
+    if layout == "heartopia_15":
+        return midi_to_key_15_custom(midi, keymaps)
+    if layout == "heartopia_22":
+        return midi_to_key_37_custom(midi, keymaps)
+
     raise ValueError(f"Unknown layout: {layout}")
